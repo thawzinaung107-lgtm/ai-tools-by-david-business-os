@@ -18,6 +18,7 @@ import {
   verifyPassword,
 } from './auth.js';
 import { createPaymentProofViewUrl, uploadPaymentProofFile } from './storage.js';
+import { queueCustomerNotification } from './notification_outbox.js';
 
 const app = Fastify({ logger: true });
 
@@ -51,8 +52,18 @@ const customerSchema = z.object({
   language_code: z.string().trim().min(2).max(10).default('my'),
   phone: z.string().trim().min(5).max(30).optional(),
   email: z.string().email().max(200).optional(),
+  telegram_chat_id: z.string().trim().max(100).optional(),
+  email_notifications_enabled: z.boolean().default(true),
+  telegram_notifications_enabled: z.boolean().default(false),
   source_code: z.string().trim().max(50).optional(),
   marketing_consent: z.boolean().default(false),
+});
+
+const notificationPreferenceSchema = z.object({
+  email: z.string().email().max(200).optional().nullable(),
+  telegram_chat_id: z.string().trim().max(100).optional().nullable(),
+  email_notifications_enabled: z.boolean(),
+  telegram_notifications_enabled: z.boolean(),
 });
 
 const orderSchema = z.object({
@@ -344,6 +355,31 @@ app.get('/api/v1/dashboard/analytics', { preHandler: requirePermission('reports.
   return { data: { range_days: rangeDays, kpis: kpis.rows[0], daily: daily.rows, top_products: products.rows, payment_breakdown: paymentBreakdown.rows } };
 });
 
+app.get('/api/v1/notifications/outbox', { preHandler: requirePermission('notifications.read') }, async (request) => {
+  const query = request.query as { status?: string; limit?: string };
+  const limit = Math.min(Math.max(Number(query.limit ?? 50) || 50, 1), 100);
+  const values: (string | number)[] = [];
+  let where = '1 = 1';
+  if (query.status) {
+    values.push(query.status);
+    where += ` and n.status = $1`;
+  }
+  values.push(limit);
+  const result = await pool.query(`
+    select n.id, n.channel, n.event_type, n.recipient, n.subject, n.status,
+           n.attempts, n.max_attempts, n.last_error, n.sent_at, n.created_at,
+           c.public_code as customer_code, c.display_name as customer_name,
+           o.public_code as order_code
+    from notification_outbox n
+    join customers c on c.id = n.customer_id
+    left join orders o on o.id = n.order_id
+    where ${where}
+    order by n.created_at desc
+    limit $${values.length}
+  `, values);
+  return { data: result.rows };
+});
+
 app.get('/api/v1/products', { preHandler: requirePermission('products.read') }, async (request) => {
   const query = request.query as { status?: string };
   const values: string[] = [];
@@ -380,7 +416,8 @@ app.get('/api/v1/customers', { preHandler: requirePermission('customers.read') }
   values.push(limit);
   const result = await pool.query(`
     select c.id, c.public_code, c.display_name, c.customer_type, c.country_code,
-           c.language_code, c.phone, c.email::text, c.source_code,
+           c.language_code, c.phone, c.email::text, c.telegram_chat_id,
+           c.email_notifications_enabled, c.telegram_notifications_enabled, c.source_code,
            c.last_contact_at, c.last_purchase_at, c.created_at,
            count(o.id)::int as order_count
     from customers c
@@ -398,13 +435,15 @@ app.post('/api/v1/customers', { preHandler: requirePermission('customers.create'
   if (!parsed.success) return sendValidationError(reply, parsed);
   try {
     const result = await pool.query(`
-      insert into customers (public_code, display_name, customer_type, country_code, language_code, phone, email, source_code, marketing_consent, assigned_user_id)
-      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-      returning id, public_code, display_name, customer_type, country_code, language_code, phone, email::text, source_code, marketing_consent, created_at
+      insert into customers (public_code, display_name, customer_type, country_code, language_code, phone, email, telegram_chat_id, email_notifications_enabled, telegram_notifications_enabled, source_code, marketing_consent, assigned_user_id)
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      returning id, public_code, display_name, customer_type, country_code, language_code, phone, email::text, telegram_chat_id, email_notifications_enabled, telegram_notifications_enabled, source_code, marketing_consent, created_at
     `, [
       makeCode('CUS'), parsed.data.display_name, parsed.data.customer_type, parsed.data.country_code ?? null,
       parsed.data.language_code, parsed.data.phone ?? null, parsed.data.email?.toLowerCase() ?? null,
-      parsed.data.source_code ?? null, parsed.data.marketing_consent, request.auth!.userId,
+      parsed.data.telegram_chat_id ?? null, parsed.data.email_notifications_enabled,
+      parsed.data.telegram_notifications_enabled, parsed.data.source_code ?? null,
+      parsed.data.marketing_consent, request.auth!.userId,
     ]);
     return reply.code(201).send({ data: result.rows[0] });
   } catch (error) {
@@ -418,10 +457,35 @@ app.get('/api/v1/customers/:id', { preHandler: requirePermission('customers.read
   if (!params.success) return reply.code(400).send({ error: 'Invalid customer id' });
   const result = await pool.query(`
     select id, public_code, display_name, customer_type, country_code, language_code,
-           phone, email::text, source_code, marketing_consent, last_contact_at,
+           phone, email::text, telegram_chat_id, email_notifications_enabled,
+           telegram_notifications_enabled, source_code, marketing_consent, last_contact_at,
            last_purchase_at, created_at, updated_at
     from customers where id = $1 and deleted_at is null
   `, [params.data.id]);
+  if (!result.rows[0]) return reply.code(404).send({ error: 'Customer not found' });
+  return { data: result.rows[0] };
+});
+
+app.patch('/api/v1/customers/:id/notification-preferences', { preHandler: requirePermission('customers.update') }, async (request, reply) => {
+  const params = z.object({ id: z.string().uuid() }).safeParse(request.params);
+  const parsed = notificationPreferenceSchema.safeParse(request.body);
+  if (!params.success) return reply.code(400).send({ error: 'Invalid customer id' });
+  if (!parsed.success) return sendValidationError(reply, parsed);
+  const result = await pool.query(`
+    update customers
+    set email = $2, telegram_chat_id = $3,
+        email_notifications_enabled = $4, telegram_notifications_enabled = $5,
+        updated_at = now()
+    where id = $1 and deleted_at is null
+    returning id, public_code, display_name, email::text, telegram_chat_id,
+              email_notifications_enabled, telegram_notifications_enabled, updated_at
+  `, [
+    params.data.id,
+    parsed.data.email?.toLowerCase() ?? null,
+    parsed.data.telegram_chat_id ?? null,
+    parsed.data.email_notifications_enabled,
+    parsed.data.telegram_notifications_enabled,
+  ]);
   if (!result.rows[0]) return reply.code(404).send({ error: 'Customer not found' });
   return { data: result.rows[0] };
 });
@@ -642,6 +706,15 @@ app.post('/api/v1/payment-proofs', { preHandler: requirePermission('payments.rea
       insert into audit_logs (actor_user_id, action, entity_type, entity_id, after_json)
       values ($1, 'SUBMIT_PAYMENT_PROOF', 'PAYMENT_PROOF', $2, $3)
     `, [request.auth!.userId, proof.rows[0].id, JSON.stringify({ order_id: orderRow.id, filename: file.originalFilename, byte_size: file.byteSize })]);
+    await queueCustomerNotification(client, {
+      customerId: orderRow.customer_id,
+      orderId: orderRow.id,
+      orderCode: orderRow.public_code,
+      sourceKey: proof.rows[0].id,
+      eventType: 'PAYMENT_PROOF_RECEIVED',
+      amount: parsed.data.claimed_amount,
+      currencyCode: 'MMK',
+    });
     await client.query('commit');
     return reply.code(201).send({ data: { ...proof.rows[0], order_id: orderRow.id, order_code: orderRow.public_code, filename: file.originalFilename, mime_type: file.mimeType, byte_size: file.byteSize } });
   } catch (error) {
@@ -662,7 +735,7 @@ app.post('/api/v1/payment-proofs/:id/verify', { preHandler: requirePermission('p
   const client = await pool.connect();
   try {
     await client.query('begin');
-    const proof = await client.query(`select pp.id, pp.order_id, pp.status, o.public_code as order_code from payment_proofs pp join orders o on o.id = pp.order_id where pp.id = $1 for update`, [params.data.id]);
+    const proof = await client.query(`select pp.id, pp.order_id, pp.status, o.public_code as order_code, o.customer_id, o.total_amount from payment_proofs pp join orders o on o.id = pp.order_id where pp.id = $1 for update`, [params.data.id]);
     const row = proof.rows[0];
     if (!row) { await client.query('rollback'); return reply.code(404).send({ error: 'Payment proof not found' }); }
     if (row.status !== 'PROOF_RECEIVED' && row.status !== 'NEED_MORE_INFORMATION') { await client.query('rollback'); return reply.code(409).send({ error: `Payment proof is already ${row.status}` }); }
@@ -673,9 +746,19 @@ app.post('/api/v1/payment-proofs/:id/verify', { preHandler: requirePermission('p
       on conflict (order_id) do update set payment_proof_id = excluded.payment_proof_id, status = 'VERIFIED', amount_received = excluded.amount_received, verified_by = excluded.verified_by, verified_at = excluded.verified_at, updated_at = now()
     `, [row.id, request.auth!.userId]);
     await client.query(`update orders set status = 'DELIVERY_PENDING', payment_status = 'VERIFIED', delivery_status = 'PENDING', updated_at = now() where id = $1`, [row.order_id]);
-    await client.query(`insert into deliveries (public_code, order_id, status, method) values ($1, $2, 'PENDING', 'MANUAL_DIGITAL')`, [makeCode('DEL'), row.order_id]);
-    await client.query(`insert into delivery_events (delivery_id, event_type, status, message, created_by) select id, 'QUEUED', 'PENDING', 'Payment verified; delivery queued', $2 from deliveries where order_id = $1 and status = 'PENDING' order by created_at desc limit 1`, [row.order_id, request.auth!.userId]);
+    const delivery = await client.query(`insert into deliveries (public_code, order_id, status, method) values ($1, $2, 'PENDING', 'MANUAL_DIGITAL') returning id, public_code`, [makeCode('DEL'), row.order_id]);
+    await client.query(`insert into delivery_events (delivery_id, event_type, status, message, created_by) values ($1, 'QUEUED', 'PENDING', 'Payment verified; delivery queued', $2)`, [delivery.rows[0].id, request.auth!.userId]);
     await client.query(`insert into audit_logs (actor_user_id, action, entity_type, entity_id, after_json) values ($1, 'VERIFY_PAYMENT_PROOF', 'PAYMENT_PROOF', $2, $3)`, [request.auth!.userId, row.id, JSON.stringify({ order_id: row.order_id, order_code: row.order_code, review_note: parsed.data.review_note ?? null })]);
+    await queueCustomerNotification(client, {
+      customerId: row.customer_id,
+      orderId: row.order_id,
+      orderCode: row.order_code,
+      sourceKey: row.id,
+      eventType: 'PAYMENT_VERIFIED',
+      amount: row.total_amount,
+      currencyCode: 'MMK',
+      deliveryCode: delivery.rows[0].public_code,
+    });
     await client.query('commit');
     return { data: { payment_proof_id: row.id, order_id: row.order_id, order_code: row.order_code, payment_status: 'VERIFIED', delivery_status: 'PENDING' } };
   } catch (error) {
@@ -694,7 +777,7 @@ app.post('/api/v1/payment-proofs/:id/reject', { preHandler: requirePermission('p
   const client = await pool.connect();
   try {
     await client.query('begin');
-    const proof = await client.query(`select pp.id, pp.order_id, pp.status, pp.claimed_amount, pp.payment_method_id, o.public_code as order_code from payment_proofs pp join orders o on o.id = pp.order_id where pp.id = $1 for update`, [params.data.id]);
+    const proof = await client.query(`select pp.id, pp.order_id, pp.status, pp.claimed_amount, pp.payment_method_id, o.public_code as order_code, o.customer_id from payment_proofs pp join orders o on o.id = pp.order_id where pp.id = $1 for update`, [params.data.id]);
     const row = proof.rows[0];
     if (!row) { await client.query('rollback'); return reply.code(404).send({ error: 'Payment proof not found' }); }
     if (row.status !== 'PROOF_RECEIVED' && row.status !== 'NEED_MORE_INFORMATION') { await client.query('rollback'); return reply.code(409).send({ error: `Payment proof is already ${row.status}` }); }
@@ -702,6 +785,16 @@ app.post('/api/v1/payment-proofs/:id/reject', { preHandler: requirePermission('p
     await client.query(`insert into payments (order_id, payment_proof_id, status, amount_received, currency_code, verified_by, verified_at, rejection_reason) values ($1, $2, 'REJECTED', $3, 'MMK', $4, now(), $5) on conflict (order_id) do update set payment_proof_id = excluded.payment_proof_id, status = 'REJECTED', amount_received = excluded.amount_received, verified_by = excluded.verified_by, verified_at = excluded.verified_at, rejection_reason = excluded.rejection_reason, updated_at = now()`, [row.order_id, row.id, row.claimed_amount, request.auth!.userId, parsed.data.rejection_reason]);
     await client.query(`update orders set status = 'PAYMENT_PENDING', payment_status = 'REJECTED', updated_at = now() where id = $1`, [row.order_id]);
     await client.query(`insert into audit_logs (actor_user_id, action, entity_type, entity_id, after_json) values ($1, 'REJECT_PAYMENT_PROOF', 'PAYMENT_PROOF', $2, $3)`, [request.auth!.userId, row.id, JSON.stringify({ order_id: row.order_id, order_code: row.order_code, rejection_reason: parsed.data.rejection_reason })]);
+    await queueCustomerNotification(client, {
+      customerId: row.customer_id,
+      orderId: row.order_id,
+      orderCode: row.order_code,
+      sourceKey: row.id,
+      eventType: 'PAYMENT_REJECTED',
+      amount: row.claimed_amount,
+      currencyCode: 'MMK',
+      rejectionReason: parsed.data.rejection_reason,
+    });
     await client.query('commit');
     return { data: { payment_proof_id: row.id, order_id: row.order_id, order_code: row.order_code, payment_status: 'REJECTED', rejection_reason: parsed.data.rejection_reason } };
   } catch (error) {
@@ -752,7 +845,7 @@ app.post('/api/v1/deliveries/:id/start', { preHandler: requirePermission('delive
   const client = await pool.connect();
   try {
     await client.query('begin');
-    const result = await client.query(`select d.id, d.status, d.order_id, o.public_code as order_code, o.payment_status from deliveries d join orders o on o.id = d.order_id where d.id = $1 for update`, [params.data.id]);
+    const result = await client.query(`select d.id, d.public_code, d.status, d.order_id, o.public_code as order_code, o.customer_id, o.payment_status from deliveries d join orders o on o.id = d.order_id where d.id = $1 for update`, [params.data.id]);
     const row = result.rows[0];
     if (!row) { await client.query('rollback'); return reply.code(404).send({ error: 'Delivery not found' }); }
     if (row.payment_status !== 'VERIFIED') { await client.query('rollback'); return reply.code(409).send({ error: 'Delivery is blocked until payment is verified' }); }
@@ -760,6 +853,15 @@ app.post('/api/v1/deliveries/:id/start', { preHandler: requirePermission('delive
     await client.query(`update deliveries set status = 'PROCESSING', delivery_reference = coalesce($2, delivery_reference), updated_at = now() where id = $1`, [row.id, parsed.data.delivery_reference ?? null]);
     await client.query(`insert into delivery_events (delivery_id, event_type, status, message, tracking_reference, created_by) values ($1, 'PROCESSING_STARTED', 'PROCESSING', $2, $3, $4)`, [row.id, parsed.data.message ?? 'Fulfilment started', parsed.data.delivery_reference ?? null, request.auth!.userId]);
     await client.query(`insert into audit_logs (actor_user_id, action, entity_type, entity_id, after_json) values ($1, 'START_DELIVERY', 'DELIVERY', $2, $3)`, [request.auth!.userId, row.id, JSON.stringify({ order_id: row.order_id, order_code: row.order_code, delivery_reference: parsed.data.delivery_reference ?? null })]);
+    await queueCustomerNotification(client, {
+      customerId: row.customer_id,
+      orderId: row.order_id,
+      orderCode: row.order_code,
+      sourceKey: row.id,
+      eventType: 'DELIVERY_PROCESSING',
+      deliveryCode: row.public_code,
+      deliveryReference: parsed.data.delivery_reference ?? null,
+    });
     await client.query('commit');
     return { data: await getDelivery(row.id) };
   } catch (error) {
@@ -777,7 +879,7 @@ app.post('/api/v1/deliveries/:id/complete', { preHandler: requirePermission('del
   const client = await pool.connect();
   try {
     await client.query('begin');
-    const result = await client.query(`select d.id, d.status, d.order_id, o.public_code as order_code, o.payment_status from deliveries d join orders o on o.id = d.order_id where d.id = $1 for update`, [params.data.id]);
+    const result = await client.query(`select d.id, d.public_code, d.status, d.order_id, o.public_code as order_code, o.customer_id, o.payment_status from deliveries d join orders o on o.id = d.order_id where d.id = $1 for update`, [params.data.id]);
     const row = result.rows[0];
     if (!row) { await client.query('rollback'); return reply.code(404).send({ error: 'Delivery not found' }); }
     if (row.payment_status !== 'VERIFIED') { await client.query('rollback'); return reply.code(409).send({ error: 'Delivery is blocked until payment is verified' }); }
@@ -786,6 +888,16 @@ app.post('/api/v1/deliveries/:id/complete', { preHandler: requirePermission('del
     await client.query(`update orders set status = 'DELIVERED', delivery_status = 'DELIVERED', access_start_date = $2, expiry_date = $3, updated_at = now() where id = $1`, [row.order_id, parsed.data.access_start_date ?? null, parsed.data.expiry_date ?? null]);
     await client.query(`insert into delivery_events (delivery_id, event_type, status, message, tracking_reference, created_by) values ($1, 'DELIVERED', 'DELIVERED', $2, $3, $4)`, [row.id, parsed.data.message ?? 'Digital product delivered', parsed.data.delivery_reference, request.auth!.userId]);
     await client.query(`insert into audit_logs (actor_user_id, action, entity_type, entity_id, after_json) values ($1, 'COMPLETE_DELIVERY', 'DELIVERY', $2, $3)`, [request.auth!.userId, row.id, JSON.stringify({ order_id: row.order_id, order_code: row.order_code, delivery_reference: parsed.data.delivery_reference, access_start_date: parsed.data.access_start_date ?? null, expiry_date: parsed.data.expiry_date ?? null })]);
+    await queueCustomerNotification(client, {
+      customerId: row.customer_id,
+      orderId: row.order_id,
+      orderCode: row.order_code,
+      sourceKey: row.id,
+      eventType: 'DELIVERY_COMPLETED',
+      deliveryCode: row.public_code,
+      deliveryReference: parsed.data.delivery_reference,
+      expiryDate: parsed.data.expiry_date ?? null,
+    });
     await client.query('commit');
     return { data: await getDelivery(row.id) };
   } catch (error) {
@@ -802,7 +914,7 @@ app.post('/api/v1/deliveries/:id/fail', { preHandler: requirePermission('deliver
   const client = await pool.connect();
   try {
     await client.query('begin');
-    const result = await client.query(`select d.id, d.status, d.order_id, o.public_code as order_code from deliveries d join orders o on o.id = d.order_id where d.id = $1 for update`, [params.data.id]);
+    const result = await client.query(`select d.id, d.public_code, d.status, d.order_id, o.public_code as order_code, o.customer_id from deliveries d join orders o on o.id = d.order_id where d.id = $1 for update`, [params.data.id]);
     const row = result.rows[0];
     if (!row) { await client.query('rollback'); return reply.code(404).send({ error: 'Delivery not found' }); }
     if (!['PENDING', 'PROCESSING'].includes(row.status)) { await client.query('rollback'); return reply.code(409).send({ error: `Delivery is already ${row.status}` }); }
@@ -810,6 +922,15 @@ app.post('/api/v1/deliveries/:id/fail', { preHandler: requirePermission('deliver
     await client.query(`update orders set delivery_status = 'FAILED', updated_at = now() where id = $1`, [row.order_id]);
     await client.query(`insert into delivery_events (delivery_id, event_type, status, message, created_by) values ($1, 'DELIVERY_FAILED', 'FAILED', $2, $3)`, [row.id, parsed.data.failure_reason, request.auth!.userId]);
     await client.query(`insert into audit_logs (actor_user_id, action, entity_type, entity_id, after_json) values ($1, 'FAIL_DELIVERY', 'DELIVERY', $2, $3)`, [request.auth!.userId, row.id, JSON.stringify({ order_id: row.order_id, order_code: row.order_code, failure_reason: parsed.data.failure_reason })]);
+    await queueCustomerNotification(client, {
+      customerId: row.customer_id,
+      orderId: row.order_id,
+      orderCode: row.order_code,
+      sourceKey: row.id,
+      eventType: 'DELIVERY_FAILED',
+      deliveryCode: row.public_code,
+      failureReason: parsed.data.failure_reason,
+    });
     await client.query('commit');
     return { data: await getDelivery(row.id) };
   } catch (error) {

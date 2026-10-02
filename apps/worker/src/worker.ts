@@ -1,7 +1,9 @@
 import 'dotenv/config';
+import { closeNotificationPool, processNotificationOutbox } from './notifications.js';
 
 const intervalMs = Number(process.env.WORKER_POLL_INTERVAL_MS ?? 10_000);
 let running = true;
+let polling = false;
 
 console.log('AI Tools By David worker started', {
   mode: process.env.NODE_ENV ?? 'development',
@@ -9,21 +11,28 @@ console.log('AI Tools By David worker started', {
 });
 
 async function poll() {
-  if (!running) return;
-  // TODO: connect to the queue and process webhook/message/notification jobs.
-  // Keep payment verification and delivery as explicit Owner/CS actions.
+  if (!running || polling) return;
+  polling = true;
+  try {
+    await processNotificationOutbox();
+  } catch (error) {
+    console.error('[notification:poll:error]', error);
+  } finally {
+    polling = false;
+  }
 }
 
-const timer = setInterval(() => {
-  void poll();
-}, intervalMs);
+void poll();
+const timer = setInterval(() => { void poll(); }, intervalMs);
 
-function shutdown(signal: string) {
+async function shutdown(signal: string) {
   console.log(`Worker received ${signal}; shutting down.`);
   running = false;
   clearInterval(timer);
-  setTimeout(() => process.exit(0), 100);
+  while (polling) await new Promise((resolve) => setTimeout(resolve, 100));
+  await closeNotificationPool();
+  process.exit(0);
 }
 
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
+process.on('SIGINT', () => { void shutdown('SIGINT'); });

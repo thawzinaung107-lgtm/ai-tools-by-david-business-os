@@ -122,7 +122,7 @@ payment_status  = PENDING
 delivery_status = PENDING
 ```
 
-No delivery endpoint is included in this slice. Payment verification and delivery must remain explicit Owner/Operations actions in the next workflow implementation.
+Payment verification and delivery remain explicit Owner/Operations actions; see the delivery API section below.
 
 ## Security notes
 
@@ -328,3 +328,87 @@ Requires `reports.read`. Supported ranges are 7 to 90 days. The response contain
 - Payment-status breakdown
 
 The authenticated dashboard now includes an **Owner Control Center**. Users with `payments.verify` can review proof rows, open a five-minute private proof URL, verify payment, or reject with a reason. Users with `reports.read` can view the analytics KPIs and trend panels. CS-only users do not receive this Owner panel.
+
+## Customer Email and Telegram notifications
+
+Customer notifications are transactional only. They are queued after these state transitions:
+
+| Event | Email / Telegram message |
+|---|---|
+| `PAYMENT_PROOF_RECEIVED` | Proof received; Owner review is pending |
+| `PAYMENT_VERIFIED` | Payment verified; digital delivery is being released |
+| `PAYMENT_REJECTED` | Proof needs attention, including the rejection reason |
+| `DELIVERY_PROCESSING` | Fulfilment has started |
+| `DELIVERY_COMPLETED` | Delivery completed, with expiry/reference/tracking details |
+| `DELIVERY_FAILED` | Delivery needs CS follow-up |
+
+Messages are rendered in Burmese when the customer `language_code` starts with `my`; otherwise English is used.
+
+### Customer preference API
+
+`PATCH /api/v1/customers/:id/notification-preferences`
+
+Requires `customers.update`.
+
+```json
+{
+  "email": "customer@example.com",
+  "telegram_chat_id": "123456789",
+  "email_notifications_enabled": true,
+  "telegram_notifications_enabled": true
+}
+```
+
+A Telegram chat ID is usable only after that customer has opened the store’s Telegram bot and pressed `/start`. The system does not scrape or guess chat IDs.
+
+### Outbox monitoring
+
+`GET /api/v1/notifications/outbox?status=FAILED&limit=50`
+
+Requires `notifications.read`. The response exposes delivery status and error metadata but not provider secrets.
+
+The API uses an idempotency key per source event, channel, and recipient. A repeated payment-review request cannot create duplicate messages for the same event. The worker claims rows with PostgreSQL row locks, retries transient errors with exponential backoff, and marks a row `SKIPPED` after its maximum attempts.
+
+### Render variables
+
+API, background worker, and cron require these variables:
+
+```text
+EMAIL_PROVIDER=resend
+EMAIL_FROM=Aladdin Digital Store <verified-sender@example.com>
+RESEND_API_KEY=<secret>
+TELEGRAM_BOT_TOKEN=<secret>
+```
+
+The API also requires:
+
+```text
+PUBLIC_TRACKING_BASE_URL=https://atd-api-aw7o.onrender.com/api/v1/tracking
+```
+
+Storage variables remain private and are required only by the API:
+
+```text
+STORAGE_ENDPOINT=<S3-compatible endpoint>
+STORAGE_BUCKET=<private bucket name>
+STORAGE_REGION=auto
+STORAGE_FORCE_PATH_STYLE=false
+STORAGE_ACCESS_KEY=<secret>
+STORAGE_SECRET_KEY=<secret>
+```
+
+For Cloudflare R2, use the account-specific S3 endpoint, an R2 bucket name, `STORAGE_REGION=auto`, and `STORAGE_FORCE_PATH_STYLE=false`. Create an R2 API token limited to the selected bucket with object read/write access; do not use a global account token.
+
+### Safe end-to-end test order
+
+1. Create or select a test customer with a test Email address.
+2. Start the Telegram bot from a separate test Telegram account and save only that chat ID to the customer record.
+3. Create a payment-pending test order.
+4. Upload a non-sensitive test image or PDF through `POST /api/v1/payment-proofs`.
+5. Confirm the upload returns `201`, the object exists in the private bucket, and only metadata is stored in PostgreSQL.
+6. Verify the proof as Owner and confirm one `PAYMENT_VERIFIED` Email/Telegram outbox row per enabled channel.
+7. Start and complete delivery, then confirm `DELIVERY_PROCESSING` and `DELIVERY_COMPLETED` outbox rows.
+8. Check `/api/v1/notifications/outbox` and the provider inbox/chat.
+9. Delete the test customer/order/object only after the audit evidence is recorded, if a destructive cleanup is required.
+
+Never use a real customer’s payment screenshot for the first integration test, and never place provider secrets in Git, chat messages, notification bodies, or customer notes.

@@ -14,6 +14,8 @@ services:
         value: production
       - key: CORS_ORIGIN
         value: https://atd-web.onrender.com
+      - key: PUBLIC_TRACKING_BASE_URL
+        value: https://atd-api-aw7o.onrender.com/api/v1/tracking
       - key: AUTH_SECRET
         sync: false
       - key: BOOTSTRAP_SECRET
@@ -29,6 +31,14 @@ services:
       - key: STORAGE_ACCESS_KEY
         sync: false
       - key: STORAGE_SECRET_KEY
+        sync: false
+      - key: EMAIL_PROVIDER
+        value: resend
+      - key: EMAIL_FROM
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: DATABASE_URL
         fromDatabase:
@@ -56,6 +66,14 @@ services:
         fromDatabase:
           name: atd-postgres
           property: connectionString
+      - key: EMAIL_PROVIDER
+        value: resend
+      - key: EMAIL_FROM
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
 
   - type: cron
     name: atd-cron
@@ -73,6 +91,14 @@ services:
         fromDatabase:
           name: atd-postgres
           property: connectionString
+      - key: EMAIL_PROVIDER
+        value: resend
+      - key: EMAIL_FROM
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
 
   - type: web
     name: atd-web
