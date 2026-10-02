@@ -283,11 +283,6 @@ create table audit_logs (
   created_at timestamptz not null default now()
 );
 
-create table schema_migrations (
-  version varchar(255) primary key,
-  applied_at timestamptz not null default now()
-);
-
 create index customers_assigned_idx on customers(assigned_user_id, customer_type) where deleted_at is null;
 create index leads_followup_idx on leads(next_follow_up_at, stage) where deleted_at is null;
 create index orders_queue_idx on orders(payment_status, delivery_status, created_at desc) where deleted_at is null;
