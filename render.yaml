@@ -4,7 +4,7 @@ services:
     runtime: node
     rootDir: .
     buildCommand: pnpm install --frozen-lockfile=false && pnpm --filter @atd/api build
-    preDeployCommand: pnpm --filter @atd/api db:migrate
+    preDeployCommand: pnpm --filter @atd/api db:migrate && pnpm --filter @atd/api db:seed
     startCommand: pnpm --filter @atd/api start
     healthCheckPath: /ready
     plan: starter
