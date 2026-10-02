@@ -3,7 +3,7 @@ services:
     name: atd-api
     runtime: node
     rootDir: .
-    buildCommand: corepack enable && pnpm install --frozen-lockfile=false && pnpm --filter @atd/api build
+    buildCommand: pnpm install --frozen-lockfile=false && pnpm --filter @atd/api build
     preDeployCommand: pnpm --filter @atd/api db:migrate
     startCommand: pnpm --filter @atd/api start
     healthCheckPath: /ready
@@ -29,7 +29,7 @@ services:
     name: atd-worker
     runtime: node
     rootDir: .
-    buildCommand: corepack enable && pnpm install --frozen-lockfile=false && pnpm --filter @atd/worker build
+    buildCommand: pnpm install --frozen-lockfile=false && pnpm --filter @atd/worker build
     startCommand: pnpm --filter @atd/worker start
     plan: starter
     region: singapore
@@ -46,7 +46,7 @@ services:
     runtime: node
     rootDir: .
     schedule: "*/15 * * * *"
-    buildCommand: corepack enable && pnpm install --frozen-lockfile=false && pnpm --filter @atd/worker build
+    buildCommand: pnpm install --frozen-lockfile=false && pnpm --filter @atd/worker build
     startCommand: pnpm --filter @atd/worker cron
     plan: starter
     region: singapore
@@ -62,7 +62,7 @@ services:
     name: atd-web
     runtime: static
     rootDir: .
-    buildCommand: corepack enable && pnpm install --frozen-lockfile=false && pnpm --filter @atd/web build
+    buildCommand: pnpm install --frozen-lockfile=false && pnpm --filter @atd/web build
     staticPublishPath: apps/web/dist
     buildFilter:
       paths:
