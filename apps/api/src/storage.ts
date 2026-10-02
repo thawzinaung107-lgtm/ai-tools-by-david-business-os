@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 const MAX_PROOF_BYTES = 10 * 1024 * 1024;
 const ALLOWED_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'application/pdf']);
@@ -13,6 +14,15 @@ function storageConfig() {
     throw new Error('Private object storage is not configured');
   }
   return { endpoint, bucket, accessKeyId, secretAccessKey };
+}
+
+function storageClient(config: ReturnType<typeof storageConfig>) {
+  return new S3Client({
+    endpoint: config.endpoint,
+    region: process.env.STORAGE_REGION ?? 'auto',
+    forcePathStyle: process.env.STORAGE_FORCE_PATH_STYLE === 'true',
+    credentials: { accessKeyId: config.accessKeyId, secretAccessKey: config.secretAccessKey },
+  });
 }
 
 function safeFilename(filename: string) {
@@ -35,12 +45,7 @@ export async function uploadPaymentProofFile(input: {
   const filename = validateProofFile(input.filename, input.mimeType, input.bytes.byteLength);
   const checksum = createHash('sha256').update(input.bytes).digest('hex');
   const key = `payment-proofs/${new Date().toISOString().slice(0, 10)}/${input.paymentProofId}/${randomBytes(8).toString('hex')}-${filename}`;
-  const client = new S3Client({
-    endpoint: config.endpoint,
-    region: process.env.STORAGE_REGION ?? 'auto',
-    forcePathStyle: process.env.STORAGE_FORCE_PATH_STYLE === 'true',
-    credentials: { accessKeyId: config.accessKeyId, secretAccessKey: config.secretAccessKey },
-  });
+  const client = storageClient(config);
   await client.send(new PutObjectCommand({
     Bucket: config.bucket,
     Key: key,
@@ -50,4 +55,10 @@ export async function uploadPaymentProofFile(input: {
     Metadata: { proof_id: input.paymentProofId, checksum_sha256: checksum },
   }));
   return { storageKey: key, originalFilename: filename, mimeType: input.mimeType, byteSize: input.bytes.byteLength, checksumSha256: checksum };
+}
+
+export async function createPaymentProofViewUrl(storageKey: string) {
+  const config = storageConfig();
+  const client = storageClient(config);
+  return getSignedUrl(client, new GetObjectCommand({ Bucket: config.bucket, Key: storageKey }), { expiresIn: 300 });
 }

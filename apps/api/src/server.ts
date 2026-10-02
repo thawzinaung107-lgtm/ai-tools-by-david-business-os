@@ -17,7 +17,7 @@ import {
   verifyBootstrapSecret,
   verifyPassword,
 } from './auth.js';
-import { uploadPaymentProofFile } from './storage.js';
+import { createPaymentProofViewUrl, uploadPaymentProofFile } from './storage.js';
 
 const app = Fastify({ logger: true });
 
@@ -82,6 +82,22 @@ const proofRejectSchema = z.object({
   review_note: z.string().trim().max(500).optional(),
 });
 
+const deliveryProcessingSchema = z.object({
+  delivery_reference: z.string().trim().max(200).optional(),
+  message: z.string().trim().max(500).optional(),
+});
+
+const deliveryCompleteSchema = z.object({
+  delivery_reference: z.string().trim().min(2).max(200),
+  access_start_date: z.string().date().optional(),
+  expiry_date: z.string().date().optional(),
+  message: z.string().trim().max(500).optional(),
+});
+
+const deliveryFailSchema = z.object({
+  failure_reason: z.string().trim().min(3).max(255),
+});
+
 function makeCode(prefix: string) {
   return `${prefix}-${randomBytes(5).toString('hex').toUpperCase()}`;
 }
@@ -116,6 +132,29 @@ async function getOrder(orderId: string) {
     where o.id = $1 and o.deleted_at is null
     group by o.id, c.id
   `, [orderId]);
+  return result.rows[0] ?? null;
+}
+
+async function getDelivery(deliveryId: string) {
+  const result = await pool.query(`
+    select d.id, d.public_code, d.status, d.method, d.delivery_reference,
+           d.delivered_by, d.delivered_at, d.access_start_date, d.expiry_date,
+           d.failure_reason, d.created_at, d.updated_at,
+           o.id as order_id, o.public_code as order_code, o.total_amount,
+           o.currency_code, o.payment_status, o.delivery_status,
+           c.public_code as customer_code, c.display_name as customer_name,
+           coalesce(json_agg(json_build_object(
+             'id', de.id, 'event_type', de.event_type, 'status', de.status,
+             'message', de.message, 'tracking_reference', de.tracking_reference,
+             'created_at', de.created_at
+           ) order by de.created_at desc) filter (where de.id is not null), '[]') as events
+    from deliveries d
+    join orders o on o.id = d.order_id
+    join customers c on c.id = o.customer_id
+    left join delivery_events de on de.delivery_id = d.id
+    where d.id = $1
+    group by d.id, o.id, c.id
+  `, [deliveryId]);
   return result.rows[0] ?? null;
 }
 
@@ -256,6 +295,53 @@ app.get('/api/v1/dashboard/summary', { preHandler: requirePermission('dashboard.
       (select coalesce(sum(total_amount), 0)::numeric from orders where deleted_at is null and payment_status = 'VERIFIED' and created_at >= current_date) as verified_revenue_today
   `);
   return { data: result.rows[0] };
+});
+
+app.get('/api/v1/dashboard/analytics', { preHandler: requirePermission('reports.read') }, async (request, reply) => {
+  const query = request.query as { range_days?: string };
+  const rangeDays = Math.min(Math.max(Number(query.range_days ?? 30) || 30, 7), 90);
+  const [kpis, daily, products, paymentBreakdown] = await Promise.all([
+    pool.query(`
+      select
+        count(*)::int as order_count,
+        count(*) filter (where payment_status = 'VERIFIED')::int as verified_order_count,
+        count(*) filter (where payment_status = 'REJECTED')::int as rejected_payment_count,
+        coalesce(sum(total_amount) filter (where payment_status = 'VERIFIED'), 0)::numeric as verified_revenue,
+        coalesce(avg(total_amount) filter (where payment_status = 'VERIFIED'), 0)::numeric as average_verified_order_value,
+        (select count(*)::int from customers where created_at >= current_date - ($1::int - 1) and deleted_at is null) as new_customer_count
+      from orders
+      where created_at >= current_date - ($1::int - 1) and deleted_at is null
+    `, [rangeDays]),
+    pool.query(`
+      select to_char(day::date, 'YYYY-MM-DD') as date,
+             coalesce(count(o.id), 0)::int as order_count,
+             coalesce(sum(o.total_amount) filter (where o.payment_status = 'VERIFIED'), 0)::numeric as verified_revenue
+      from generate_series(current_date - ($1::int - 1), current_date, interval '1 day') as day
+      left join orders o on o.created_at::date = day::date and o.deleted_at is null
+      group by day::date
+      order by day::date
+    `, [rangeDays]),
+    pool.query(`
+      select oi.product_name_snapshot as product_name,
+             coalesce(sum(oi.quantity), 0)::int as units_sold,
+             coalesce(sum(oi.line_total), 0)::numeric as verified_revenue
+      from order_items oi join orders o on o.id = oi.order_id
+      where o.created_at >= current_date - ($1::int - 1)
+        and o.deleted_at is null and o.payment_status = 'VERIFIED'
+      group by oi.product_name_snapshot
+      order by verified_revenue desc
+      limit 8
+    `, [rangeDays]),
+    pool.query(`
+      select payment_status as status, count(*)::int as count
+      from orders
+      where created_at >= current_date - ($1::int - 1) and deleted_at is null
+      group by payment_status
+      order by count desc
+    `, [rangeDays]),
+  ]);
+  if (!kpis.rows[0]) return reply.code(500).send({ error: 'Analytics could not be calculated' });
+  return { data: { range_days: rangeDays, kpis: kpis.rows[0], daily: daily.rows, top_products: products.rows, payment_breakdown: paymentBreakdown.rows } };
 });
 
 app.get('/api/v1/products', { preHandler: requirePermission('products.read') }, async (request) => {
@@ -473,6 +559,24 @@ app.get('/api/v1/payment-proofs', { preHandler: requirePermission('payments.read
   return { data: result.rows };
 });
 
+app.get('/api/v1/payment-proofs/:id/view-url', { preHandler: requirePermission('payments.read') }, async (request, reply) => {
+  const params = z.object({ id: z.string().uuid() }).safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'Invalid payment proof id' });
+  const result = await pool.query(`
+    select ppf.storage_key, ppf.original_filename, ppf.mime_type, ppf.byte_size,
+           pp.id as payment_proof_id, pp.public_code, pp.status
+    from payment_proof_files ppf join payment_proofs pp on pp.id = ppf.payment_proof_id
+    where ppf.payment_proof_id = $1
+  `, [params.data.id]);
+  if (!result.rows[0]) return reply.code(404).send({ error: 'Payment proof file not found' });
+  try {
+    return { data: { payment_proof_id: result.rows[0].payment_proof_id, public_code: result.rows[0].public_code, status: result.rows[0].status, filename: result.rows[0].original_filename, mime_type: result.rows[0].mime_type, byte_size: result.rows[0].byte_size, url: await createPaymentProofViewUrl(result.rows[0].storage_key), expires_in_seconds: 300 } };
+  } catch (error) {
+    if ((error as Error).message === 'Private object storage is not configured') return reply.code(503).send({ error: 'Private object storage is not configured yet' });
+    throw error;
+  }
+});
+
 app.post('/api/v1/payment-proofs', { preHandler: requirePermission('payments.read') }, async (request, reply) => {
   const fields: Record<string, string> = {};
   let uploadedFile: { filename: string; mimeType: string; bytes: Buffer } | null = null;
@@ -570,6 +674,7 @@ app.post('/api/v1/payment-proofs/:id/verify', { preHandler: requirePermission('p
     `, [row.id, request.auth!.userId]);
     await client.query(`update orders set status = 'DELIVERY_PENDING', payment_status = 'VERIFIED', delivery_status = 'PENDING', updated_at = now() where id = $1`, [row.order_id]);
     await client.query(`insert into deliveries (public_code, order_id, status, method) values ($1, $2, 'PENDING', 'MANUAL_DIGITAL')`, [makeCode('DEL'), row.order_id]);
+    await client.query(`insert into delivery_events (delivery_id, event_type, status, message, created_by) select id, 'QUEUED', 'PENDING', 'Payment verified; delivery queued', $2 from deliveries where order_id = $1 and status = 'PENDING' order by created_at desc limit 1`, [row.order_id, request.auth!.userId]);
     await client.query(`insert into audit_logs (actor_user_id, action, entity_type, entity_id, after_json) values ($1, 'VERIFY_PAYMENT_PROOF', 'PAYMENT_PROOF', $2, $3)`, [request.auth!.userId, row.id, JSON.stringify({ order_id: row.order_id, order_code: row.order_code, review_note: parsed.data.review_note ?? null })]);
     await client.query('commit');
     return { data: { payment_proof_id: row.id, order_id: row.order_id, order_code: row.order_code, payment_status: 'VERIFIED', delivery_status: 'PENDING' } };
@@ -605,6 +710,133 @@ app.post('/api/v1/payment-proofs/:id/reject', { preHandler: requirePermission('p
   } finally {
     client.release();
   }
+});
+
+app.get('/api/v1/deliveries', { preHandler: requirePermission('delivery.read') }, async (request) => {
+  const query = request.query as { status?: string; limit?: string };
+  const limit = Math.min(Math.max(Number(query.limit ?? 50) || 50, 1), 100);
+  const values: (string | number)[] = [];
+  let where = '1 = 1';
+  if (query.status) {
+    values.push(query.status);
+    where += ` and d.status = $1`;
+  }
+  values.push(limit);
+  const result = await pool.query(`
+    select d.id, d.public_code, d.status, d.method, d.delivery_reference,
+           d.delivered_at, d.access_start_date, d.expiry_date, d.failure_reason,
+           d.created_at, o.id as order_id, o.public_code as order_code,
+           o.total_amount, o.currency_code, o.payment_status,
+           c.public_code as customer_code, c.display_name as customer_name
+    from deliveries d join orders o on o.id = d.order_id join customers c on c.id = o.customer_id
+    where ${where}
+    order by case d.status when 'PROCESSING' then 1 when 'PENDING' then 2 when 'FAILED' then 3 else 4 end, d.created_at desc
+    limit $${values.length}
+  `, values);
+  return { data: result.rows };
+});
+
+app.get('/api/v1/deliveries/:id', { preHandler: requirePermission('delivery.read') }, async (request, reply) => {
+  const params = z.object({ id: z.string().uuid() }).safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'Invalid delivery id' });
+  const delivery = await getDelivery(params.data.id);
+  if (!delivery) return reply.code(404).send({ error: 'Delivery not found' });
+  return { data: delivery };
+});
+
+app.post('/api/v1/deliveries/:id/start', { preHandler: requirePermission('delivery.update') }, async (request, reply) => {
+  const params = z.object({ id: z.string().uuid() }).safeParse(request.params);
+  const parsed = deliveryProcessingSchema.safeParse(request.body ?? {});
+  if (!params.success) return reply.code(400).send({ error: 'Invalid delivery id' });
+  if (!parsed.success) return sendValidationError(reply, parsed);
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    const result = await client.query(`select d.id, d.status, d.order_id, o.public_code as order_code, o.payment_status from deliveries d join orders o on o.id = d.order_id where d.id = $1 for update`, [params.data.id]);
+    const row = result.rows[0];
+    if (!row) { await client.query('rollback'); return reply.code(404).send({ error: 'Delivery not found' }); }
+    if (row.payment_status !== 'VERIFIED') { await client.query('rollback'); return reply.code(409).send({ error: 'Delivery is blocked until payment is verified' }); }
+    if (row.status !== 'PENDING') { await client.query('rollback'); return reply.code(409).send({ error: `Delivery is already ${row.status}` }); }
+    await client.query(`update deliveries set status = 'PROCESSING', delivery_reference = coalesce($2, delivery_reference), updated_at = now() where id = $1`, [row.id, parsed.data.delivery_reference ?? null]);
+    await client.query(`insert into delivery_events (delivery_id, event_type, status, message, tracking_reference, created_by) values ($1, 'PROCESSING_STARTED', 'PROCESSING', $2, $3, $4)`, [row.id, parsed.data.message ?? 'Fulfilment started', parsed.data.delivery_reference ?? null, request.auth!.userId]);
+    await client.query(`insert into audit_logs (actor_user_id, action, entity_type, entity_id, after_json) values ($1, 'START_DELIVERY', 'DELIVERY', $2, $3)`, [request.auth!.userId, row.id, JSON.stringify({ order_id: row.order_id, order_code: row.order_code, delivery_reference: parsed.data.delivery_reference ?? null })]);
+    await client.query('commit');
+    return { data: await getDelivery(row.id) };
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally { client.release(); }
+});
+
+app.post('/api/v1/deliveries/:id/complete', { preHandler: requirePermission('delivery.update') }, async (request, reply) => {
+  const params = z.object({ id: z.string().uuid() }).safeParse(request.params);
+  const parsed = deliveryCompleteSchema.safeParse(request.body);
+  if (!params.success) return reply.code(400).send({ error: 'Invalid delivery id' });
+  if (!parsed.success) return sendValidationError(reply, parsed);
+  if (parsed.data.access_start_date && parsed.data.expiry_date && parsed.data.expiry_date < parsed.data.access_start_date) return reply.code(400).send({ error: 'Expiry date cannot be before access start date' });
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    const result = await client.query(`select d.id, d.status, d.order_id, o.public_code as order_code, o.payment_status from deliveries d join orders o on o.id = d.order_id where d.id = $1 for update`, [params.data.id]);
+    const row = result.rows[0];
+    if (!row) { await client.query('rollback'); return reply.code(404).send({ error: 'Delivery not found' }); }
+    if (row.payment_status !== 'VERIFIED') { await client.query('rollback'); return reply.code(409).send({ error: 'Delivery is blocked until payment is verified' }); }
+    if (!['PENDING', 'PROCESSING'].includes(row.status)) { await client.query('rollback'); return reply.code(409).send({ error: `Delivery is already ${row.status}` }); }
+    await client.query(`update deliveries set status = 'DELIVERED', delivery_reference = $2, delivered_by = $3, delivered_at = now(), access_start_date = $4, expiry_date = $5, updated_at = now() where id = $1`, [row.id, parsed.data.delivery_reference, request.auth!.userId, parsed.data.access_start_date ?? null, parsed.data.expiry_date ?? null]);
+    await client.query(`update orders set status = 'DELIVERED', delivery_status = 'DELIVERED', access_start_date = $2, expiry_date = $3, updated_at = now() where id = $1`, [row.order_id, parsed.data.access_start_date ?? null, parsed.data.expiry_date ?? null]);
+    await client.query(`insert into delivery_events (delivery_id, event_type, status, message, tracking_reference, created_by) values ($1, 'DELIVERED', 'DELIVERED', $2, $3, $4)`, [row.id, parsed.data.message ?? 'Digital product delivered', parsed.data.delivery_reference, request.auth!.userId]);
+    await client.query(`insert into audit_logs (actor_user_id, action, entity_type, entity_id, after_json) values ($1, 'COMPLETE_DELIVERY', 'DELIVERY', $2, $3)`, [request.auth!.userId, row.id, JSON.stringify({ order_id: row.order_id, order_code: row.order_code, delivery_reference: parsed.data.delivery_reference, access_start_date: parsed.data.access_start_date ?? null, expiry_date: parsed.data.expiry_date ?? null })]);
+    await client.query('commit');
+    return { data: await getDelivery(row.id) };
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally { client.release(); }
+});
+
+app.post('/api/v1/deliveries/:id/fail', { preHandler: requirePermission('delivery.update') }, async (request, reply) => {
+  const params = z.object({ id: z.string().uuid() }).safeParse(request.params);
+  const parsed = deliveryFailSchema.safeParse(request.body);
+  if (!params.success) return reply.code(400).send({ error: 'Invalid delivery id' });
+  if (!parsed.success) return sendValidationError(reply, parsed);
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    const result = await client.query(`select d.id, d.status, d.order_id, o.public_code as order_code from deliveries d join orders o on o.id = d.order_id where d.id = $1 for update`, [params.data.id]);
+    const row = result.rows[0];
+    if (!row) { await client.query('rollback'); return reply.code(404).send({ error: 'Delivery not found' }); }
+    if (!['PENDING', 'PROCESSING'].includes(row.status)) { await client.query('rollback'); return reply.code(409).send({ error: `Delivery is already ${row.status}` }); }
+    await client.query(`update deliveries set status = 'FAILED', failure_reason = $2, updated_at = now() where id = $1`, [row.id, parsed.data.failure_reason]);
+    await client.query(`update orders set delivery_status = 'FAILED', updated_at = now() where id = $1`, [row.order_id]);
+    await client.query(`insert into delivery_events (delivery_id, event_type, status, message, created_by) values ($1, 'DELIVERY_FAILED', 'FAILED', $2, $3)`, [row.id, parsed.data.failure_reason, request.auth!.userId]);
+    await client.query(`insert into audit_logs (actor_user_id, action, entity_type, entity_id, after_json) values ($1, 'FAIL_DELIVERY', 'DELIVERY', $2, $3)`, [request.auth!.userId, row.id, JSON.stringify({ order_id: row.order_id, order_code: row.order_code, failure_reason: parsed.data.failure_reason })]);
+    await client.query('commit');
+    return { data: await getDelivery(row.id) };
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally { client.release(); }
+});
+
+app.get('/api/v1/tracking/:publicCode', async (request, reply) => {
+  const params = z.object({ publicCode: z.string().regex(/^DEL-[A-Z0-9]+$/) }).safeParse(request.params);
+  if (!params.success) return reply.code(400).send({ error: 'Invalid tracking code' });
+  const result = await pool.query(`
+    select d.public_code as tracking_code, o.public_code as order_code,
+           d.status, d.method, d.delivery_reference, d.access_start_date,
+           d.expiry_date, d.delivered_at,
+           coalesce(json_agg(json_build_object(
+             'event_type', de.event_type, 'status', de.status,
+             'message', de.message, 'tracking_reference', de.tracking_reference,
+             'created_at', de.created_at
+           ) order by de.created_at desc) filter (where de.id is not null), '[]') as events
+    from deliveries d join orders o on o.id = d.order_id
+    left join delivery_events de on de.delivery_id = d.id
+    where d.public_code = $1
+    group by d.id, o.id
+  `, [params.data.publicCode]);
+  if (!result.rows[0]) return reply.code(404).send({ error: 'Tracking code not found' });
+  return { data: result.rows[0] };
 });
 
 app.get('/api/v1/orders/:id', { preHandler: requirePermission('orders.read') }, async (request, reply) => {

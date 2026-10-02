@@ -228,3 +228,103 @@ The authenticated dashboard now includes a **Customers & Order Creation** worksp
 - View that customer's recent purchase history.
 
 The UI does not expose payment verification to CS. Every new order visibly states that delivery remains blocked until Owner verifies the payment proof.
+
+## Delivery fulfillment and tracking API
+
+Payment verification is the gate that creates a digital-delivery queue record. Delivery endpoints require `delivery.read` or `delivery.update` as noted below.
+
+### Fulfillment queue
+
+`GET /api/v1/deliveries?status=PENDING&limit=50`
+
+Requires `delivery.read`. The queue includes delivery code, order/customer context, payment status, delivery status, delivery reference, and access dates.
+
+### Delivery detail and internal event timeline
+
+`GET /api/v1/deliveries/:id`
+
+Requires `delivery.read`. Returns the delivery record plus append-only events such as `QUEUED`, `PROCESSING_STARTED`, `DELIVERED`, and `DELIVERY_FAILED`.
+
+### Start fulfillment
+
+`POST /api/v1/deliveries/:id/start`
+
+Requires `delivery.update`.
+
+```json
+{
+  "delivery_reference": "internal-CS-queue-001",
+  "message": "CS has started preparing the digital access"
+}
+```
+
+This changes a payment-verified delivery from `PENDING` to `PROCESSING`. Unverified payments are rejected with `409`.
+
+### Complete digital delivery
+
+`POST /api/v1/deliveries/:id/complete`
+
+Requires `delivery.update`.
+
+```json
+{
+  "delivery_reference": "manual-delivery-reference",
+  "access_start_date": "2026-10-03",
+  "expiry_date": "2026-11-03",
+  "message": "Digital access delivered to customer"
+}
+```
+
+This changes:
+
+```text
+delivery.status       = DELIVERED
+delivery.delivered_by = current staff user
+order.status          = DELIVERED
+order.delivery_status = DELIVERED
+```
+
+The action is written to both `delivery_events` and `audit_logs`.
+
+### Mark fulfillment failed
+
+`POST /api/v1/deliveries/:id/fail`
+
+Requires `delivery.update`.
+
+```json
+{
+  "failure_reason": "Provider access was temporarily unavailable"
+}
+```
+
+The delivery becomes `FAILED`, the order delivery status becomes `FAILED`, and payment remains verified. This does not refund the order automatically.
+
+### Public customer tracking
+
+`GET /api/v1/tracking/:publicCode`
+
+No login is required. The code is the delivery public code, for example `DEL-ABC123`. The response intentionally excludes payment account details, credentials, private notes, and storage keys. It returns delivery status, delivery reference, access dates, and the safe event timeline.
+
+## Secure payment-proof viewing
+
+`GET /api/v1/payment-proofs/:id/view-url`
+
+Requires `payments.read`. It returns a presigned private-storage URL valid for 5 minutes. The API never exposes the underlying object-storage key.
+
+## Owner dashboard analytics
+
+`GET /api/v1/dashboard/analytics?range_days=30`
+
+Requires `reports.read`. Supported ranges are 7 to 90 days. The response contains:
+
+- Verified revenue
+- Verified order count
+- Rejected payment count
+- Average verified order value
+- New customer count
+- Daily order/revenue series
+- Top products by verified units and revenue
+- Payment-status breakdown
+
+The authenticated dashboard now includes an **Owner Control Center**. Users with `payments.verify` can review proof rows, open a five-minute private proof URL, verify payment, or reject with a reason. Users with `reports.read` can view the analytics KPIs and trend panels. CS-only users do not receive this Owner panel.
