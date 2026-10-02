@@ -57,8 +57,9 @@ services:
           name: atd-postgres
           property: connectionString
 
-  - type: static_site
+  - type: web
     name: atd-web
+    runtime: static
     rootDir: .
     buildCommand: corepack enable && pnpm install --frozen-lockfile=false && pnpm --filter @atd/web build
     staticPublishPath: apps/web/dist
