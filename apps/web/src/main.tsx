@@ -1,6 +1,7 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
+import { CustomerOrderWorkspace } from './components/CustomerOrderWorkspace';
 
 const apiBase = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:10000';
 const tokenKey = 'atd_access_token';
@@ -175,6 +176,7 @@ function Dashboard({ user, onSignOut }: { user: User; onSignOut: () => void }) {
         <section className="summary-strip" aria-label="Today’s business summary"><div><span>Orders today</span><strong>{summary?.orders_today ?? 0}</strong></div><div><span>Verified revenue today</span><strong>{formatMoney(summary?.verified_revenue_today ?? 0)} MMK</strong></div><div><span>Catalog products</span><strong>{products.length}</strong></div></section>
         <section className="content-grid"><div className="panel"><div className="panel-heading"><div><p className="eyebrow">OWNER ACTION</p><h2>Payment Verification Queue</h2></div><button className="ghost-button">Open queue</button></div><div className="empty-state"><div className="empty-icon">✓</div><strong>{queue.paymentProofs === 0 ? 'No payment proofs are waiting.' : `${queue.paymentProofs} proof(s) need review.`}</strong><span>Verified and rejected proofs will appear here with a full audit trail.</span></div></div><div className="panel"><div className="panel-heading"><div><p className="eyebrow">OPERATIONS</p><h2>Recent Orders</h2></div><button className="ghost-button">View all</button></div><div className="empty-state compact"><div className="empty-icon">+</div><strong>{summary?.orders_today ? `${summary.orders_today} order(s) created today.` : 'No orders today.'}</strong><span>Order detail views and CS handoff actions are the next module in the build.</span></div></div></section>
         <section className="panel catalog-panel" id="products"><div className="panel-heading"><div><p className="eyebrow">CATALOG</p><h2>Product Catalog</h2></div><span className="catalog-note">English product descriptions • Owner approval required</span></div><div className="product-table-wrap"><table className="product-table"><thead><tr><th>Product</th><th>Access options</th><th>Retail price</th><th>Status</th></tr></thead><tbody>{products.map((product) => <tr key={product.master_sku}><td><strong>{product.name}</strong><span>{product.short_description}</span></td><td>{product.variations.map((variation) => <span className="option-chip" key={variation.sku}>{variation.name}</span>)}</td><td>{product.variations.map((variation) => <span className="price-line" key={variation.sku}>{variation.name}: {formatMoney(variation.retail_price)} {variation.currency_code}</span>)}</td><td><span className={`status-pill ${product.status.toLowerCase()}`}>{product.status}</span></td></tr>)}{products.length === 0 && <tr><td colSpan={4} className="table-empty">No products returned from the API.</td></tr>}</tbody></table></div></section>
+        <CustomerOrderWorkspace products={products} />
         <footer className="footer-note"><span>Render-ready MVP operations console</span><span>•</span><span>Signed in as {user.email}</span></footer>
       </main>
     </div>

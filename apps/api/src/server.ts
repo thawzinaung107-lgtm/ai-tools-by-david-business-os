@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
+import multipart from '@fastify/multipart';
 import sensible from '@fastify/sensible';
 import { z } from 'zod';
 import { pool } from './db.js';
@@ -16,6 +17,7 @@ import {
   verifyBootstrapSecret,
   verifyPassword,
 } from './auth.js';
+import { uploadPaymentProofFile } from './storage.js';
 
 const app = Fastify({ logger: true });
 
@@ -25,6 +27,7 @@ await app.register(cors, {
   origin: process.env.CORS_ORIGIN?.split(',').map((value) => value.trim()) ?? false,
   credentials: true,
 });
+await app.register(multipart, { limits: { fileSize: 10 * 1024 * 1024, files: 1, fields: 12 } });
 
 const loginSchema = z.object({
   email: z.string().email().max(200),
@@ -60,6 +63,23 @@ const orderSchema = z.object({
   })).min(1).max(20),
   payment_method_code: z.string().trim().max(50).optional(),
   discount_amount: z.coerce.number().min(0).default(0),
+});
+
+const paymentProofSchema = z.object({
+  order_id: z.string().uuid(),
+  payment_method_code: z.string().trim().min(2).max(50),
+  claimed_amount: z.coerce.number().positive(),
+  transaction_reference: z.string().trim().min(2).max(160),
+  transaction_at: z.string().datetime().optional(),
+});
+
+const proofReviewSchema = z.object({
+  review_note: z.string().trim().max(500).optional(),
+});
+
+const proofRejectSchema = z.object({
+  rejection_reason: z.string().trim().min(3).max(255),
+  review_note: z.string().trim().max(500).optional(),
 });
 
 function makeCode(prefix: string) {
@@ -320,14 +340,19 @@ app.get('/api/v1/customers/:id', { preHandler: requirePermission('customers.read
   return { data: result.rows[0] };
 });
 
-app.get('/api/v1/orders', { preHandler: requirePermission('orders.read') }, async (request) => {
-  const query = request.query as { status?: string; limit?: string };
+app.get('/api/v1/orders', { preHandler: requirePermission('orders.read') }, async (request, reply) => {
+  const query = request.query as { status?: string; customer_id?: string; limit?: string };
+  if (query.customer_id && !z.string().uuid().safeParse(query.customer_id).success) return reply.code(400).send({ error: 'Invalid customer_id' });
   const limit = Math.min(Math.max(Number(query.limit ?? 50) || 50, 1), 100);
   const values: (string | number)[] = [];
   let where = 'o.deleted_at is null';
   if (query.status) {
     values.push(query.status);
     where += ` and o.status = $1`;
+  }
+  if (query.customer_id) {
+    values.push(query.customer_id);
+    where += ` and o.customer_id = $${values.length}`;
   }
   values.push(limit);
   const result = await pool.query(`
@@ -411,6 +436,169 @@ app.post('/api/v1/orders', { preHandler: requirePermission('orders.create') }, a
     }
     await client.query('commit');
     return reply.code(201).send({ data: await getOrder(order.rows[0].id) });
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/v1/payment-proofs', { preHandler: requirePermission('payments.read') }, async (request) => {
+  const query = request.query as { status?: string; limit?: string };
+  const limit = Math.min(Math.max(Number(query.limit ?? 50) || 50, 1), 100);
+  const values: (string | number)[] = [];
+  let where = 'pp.status is not null';
+  if (query.status) {
+    values.push(query.status);
+    where += ' and pp.status = $1';
+  }
+  values.push(limit);
+  const result = await pool.query(`
+    select pp.id, pp.public_code, pp.order_id, o.public_code as order_code,
+           o.total_amount as order_total, pp.claimed_amount, pp.transaction_reference,
+           pp.transaction_at, pp.status, pp.review_note, pp.rejection_reason,
+           pp.created_at, c.public_code as customer_code, c.display_name as customer_name,
+           pm.code as payment_method_code, pm.display_name as payment_method_name,
+           ppf.original_filename, ppf.mime_type, ppf.byte_size
+    from payment_proofs pp
+    join orders o on o.id = pp.order_id
+    join customers c on c.id = o.customer_id
+    join payment_methods pm on pm.id = pp.payment_method_id
+    left join payment_proof_files ppf on ppf.payment_proof_id = pp.id
+    where ${where}
+    order by pp.created_at desc
+    limit $${values.length}
+  `, values);
+  return { data: result.rows };
+});
+
+app.post('/api/v1/payment-proofs', { preHandler: requirePermission('payments.read') }, async (request, reply) => {
+  const fields: Record<string, string> = {};
+  let uploadedFile: { filename: string; mimeType: string; bytes: Buffer } | null = null;
+  try {
+    for await (const part of request.parts()) {
+      if (part.type === 'file') {
+        if (uploadedFile) return reply.code(400).send({ error: 'Only one payment-proof file is allowed' });
+        uploadedFile = { filename: part.filename, mimeType: part.mimetype, bytes: await part.toBuffer() };
+      } else {
+        fields[part.fieldname] = String(part.value);
+      }
+    }
+  } catch (error) {
+    if ((error as { code?: string }).code === 'FST_REQ_FILE_TOO_LARGE') return reply.code(413).send({ error: 'Payment proof must not exceed 10 MB' });
+    throw error;
+  }
+  if (!uploadedFile) return reply.code(400).send({ error: 'A payment-proof file is required' });
+  const parsed = paymentProofSchema.safeParse(fields);
+  if (!parsed.success) return sendValidationError(reply, parsed);
+
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    const order = await client.query(`
+      select o.id, o.public_code, o.customer_id, o.total_amount, o.payment_status,
+             pm.id as payment_method_id
+      from orders o
+      left join payment_methods pm on pm.code = $2 and pm.status = 'ACTIVE'
+      where o.id = $1 and o.deleted_at is null
+      for update of o
+    `, [parsed.data.order_id, parsed.data.payment_method_code.toUpperCase()]);
+    const orderRow = order.rows[0];
+    if (!orderRow) {
+      await client.query('rollback');
+      return reply.code(404).send({ error: 'Order not found' });
+    }
+    if (!orderRow.payment_method_id) {
+      await client.query('rollback');
+      return reply.code(400).send({ error: 'Payment method is not active or does not exist' });
+    }
+    if (['VERIFIED', 'REFUNDED'].includes(orderRow.payment_status)) {
+      await client.query('rollback');
+      return reply.code(409).send({ error: 'This order is already paid and cannot accept another proof' });
+    }
+    if (Number(parsed.data.claimed_amount) !== Number(orderRow.total_amount)) {
+      await client.query('rollback');
+      return reply.code(400).send({ error: 'Claimed amount must match the order total for this MVP flow' });
+    }
+
+    const proof = await client.query(`
+      insert into payment_proofs (public_code, order_id, payment_method_id, claimed_amount, transaction_reference, transaction_at, status, submitted_by)
+      values ($1, $2, $3, $4, $5, $6, 'PROOF_RECEIVED', $7)
+      returning id, public_code, status, created_at
+    `, [makeCode('PAY'), orderRow.id, orderRow.payment_method_id, parsed.data.claimed_amount, parsed.data.transaction_reference, parsed.data.transaction_at ?? null, request.auth!.userId]);
+
+    const file = await uploadPaymentProofFile({ paymentProofId: proof.rows[0].id, ...uploadedFile });
+    await client.query(`
+      insert into payment_proof_files (payment_proof_id, storage_key, original_filename, mime_type, byte_size, checksum_sha256, uploaded_by)
+      values ($1, $2, $3, $4, $5, $6, $7)
+    `, [proof.rows[0].id, file.storageKey, file.originalFilename, file.mimeType, file.byteSize, file.checksumSha256, request.auth!.userId]);
+    await client.query(`update orders set status = 'PAYMENT_PROOF_RECEIVED', payment_status = 'PROOF_RECEIVED', updated_at = now() where id = $1`, [orderRow.id]);
+    await client.query(`
+      insert into audit_logs (actor_user_id, action, entity_type, entity_id, after_json)
+      values ($1, 'SUBMIT_PAYMENT_PROOF', 'PAYMENT_PROOF', $2, $3)
+    `, [request.auth!.userId, proof.rows[0].id, JSON.stringify({ order_id: orderRow.id, filename: file.originalFilename, byte_size: file.byteSize })]);
+    await client.query('commit');
+    return reply.code(201).send({ data: { ...proof.rows[0], order_id: orderRow.id, order_code: orderRow.public_code, filename: file.originalFilename, mime_type: file.mimeType, byte_size: file.byteSize } });
+  } catch (error) {
+    await client.query('rollback');
+    if ((error as Error).message === 'Private object storage is not configured') return reply.code(503).send({ error: 'Private object storage is not configured yet' });
+    if ((error as { code?: string }).code === '23505') return reply.code(409).send({ error: 'This transaction reference has already been submitted' });
+    throw error;
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/v1/payment-proofs/:id/verify', { preHandler: requirePermission('payments.verify') }, async (request, reply) => {
+  const params = z.object({ id: z.string().uuid() }).safeParse(request.params);
+  const parsed = proofReviewSchema.safeParse(request.body ?? {});
+  if (!params.success) return reply.code(400).send({ error: 'Invalid payment proof id' });
+  if (!parsed.success) return sendValidationError(reply, parsed);
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    const proof = await client.query(`select pp.id, pp.order_id, pp.status, o.public_code as order_code from payment_proofs pp join orders o on o.id = pp.order_id where pp.id = $1 for update`, [params.data.id]);
+    const row = proof.rows[0];
+    if (!row) { await client.query('rollback'); return reply.code(404).send({ error: 'Payment proof not found' }); }
+    if (row.status !== 'PROOF_RECEIVED' && row.status !== 'NEED_MORE_INFORMATION') { await client.query('rollback'); return reply.code(409).send({ error: `Payment proof is already ${row.status}` }); }
+    await client.query(`update payment_proofs set status = 'VERIFIED', verified_by = $2, verified_at = now(), review_note = $3, updated_at = now() where id = $1`, [row.id, request.auth!.userId, parsed.data.review_note ?? null]);
+    await client.query(`
+      insert into payments (order_id, payment_proof_id, status, amount_received, currency_code, verified_by, verified_at)
+      select order_id, id, 'VERIFIED', claimed_amount, 'MMK', $2, now() from payment_proofs where id = $1
+      on conflict (order_id) do update set payment_proof_id = excluded.payment_proof_id, status = 'VERIFIED', amount_received = excluded.amount_received, verified_by = excluded.verified_by, verified_at = excluded.verified_at, updated_at = now()
+    `, [row.id, request.auth!.userId]);
+    await client.query(`update orders set status = 'DELIVERY_PENDING', payment_status = 'VERIFIED', delivery_status = 'PENDING', updated_at = now() where id = $1`, [row.order_id]);
+    await client.query(`insert into deliveries (public_code, order_id, status, method) values ($1, $2, 'PENDING', 'MANUAL_DIGITAL')`, [makeCode('DEL'), row.order_id]);
+    await client.query(`insert into audit_logs (actor_user_id, action, entity_type, entity_id, after_json) values ($1, 'VERIFY_PAYMENT_PROOF', 'PAYMENT_PROOF', $2, $3)`, [request.auth!.userId, row.id, JSON.stringify({ order_id: row.order_id, order_code: row.order_code, review_note: parsed.data.review_note ?? null })]);
+    await client.query('commit');
+    return { data: { payment_proof_id: row.id, order_id: row.order_id, order_code: row.order_code, payment_status: 'VERIFIED', delivery_status: 'PENDING' } };
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/v1/payment-proofs/:id/reject', { preHandler: requirePermission('payments.verify') }, async (request, reply) => {
+  const params = z.object({ id: z.string().uuid() }).safeParse(request.params);
+  const parsed = proofRejectSchema.safeParse(request.body);
+  if (!params.success) return reply.code(400).send({ error: 'Invalid payment proof id' });
+  if (!parsed.success) return sendValidationError(reply, parsed);
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    const proof = await client.query(`select pp.id, pp.order_id, pp.status, pp.claimed_amount, pp.payment_method_id, o.public_code as order_code from payment_proofs pp join orders o on o.id = pp.order_id where pp.id = $1 for update`, [params.data.id]);
+    const row = proof.rows[0];
+    if (!row) { await client.query('rollback'); return reply.code(404).send({ error: 'Payment proof not found' }); }
+    if (row.status !== 'PROOF_RECEIVED' && row.status !== 'NEED_MORE_INFORMATION') { await client.query('rollback'); return reply.code(409).send({ error: `Payment proof is already ${row.status}` }); }
+    await client.query(`update payment_proofs set status = 'REJECTED', verified_by = $2, verified_at = now(), rejection_reason = $3, review_note = $4, updated_at = now() where id = $1`, [row.id, request.auth!.userId, parsed.data.rejection_reason, parsed.data.review_note ?? null]);
+    await client.query(`insert into payments (order_id, payment_proof_id, status, amount_received, currency_code, verified_by, verified_at, rejection_reason) values ($1, $2, 'REJECTED', $3, 'MMK', $4, now(), $5) on conflict (order_id) do update set payment_proof_id = excluded.payment_proof_id, status = 'REJECTED', amount_received = excluded.amount_received, verified_by = excluded.verified_by, verified_at = excluded.verified_at, rejection_reason = excluded.rejection_reason, updated_at = now()`, [row.order_id, row.id, row.claimed_amount, request.auth!.userId, parsed.data.rejection_reason]);
+    await client.query(`update orders set status = 'PAYMENT_PENDING', payment_status = 'REJECTED', updated_at = now() where id = $1`, [row.order_id]);
+    await client.query(`insert into audit_logs (actor_user_id, action, entity_type, entity_id, after_json) values ($1, 'REJECT_PAYMENT_PROOF', 'PAYMENT_PROOF', $2, $3)`, [request.auth!.userId, row.id, JSON.stringify({ order_id: row.order_id, order_code: row.order_code, rejection_reason: parsed.data.rejection_reason })]);
+    await client.query('commit');
+    return { data: { payment_proof_id: row.id, order_id: row.order_id, order_code: row.order_code, payment_status: 'REJECTED', rejection_reason: parsed.data.rejection_reason } };
   } catch (error) {
     await client.query('rollback');
     throw error;

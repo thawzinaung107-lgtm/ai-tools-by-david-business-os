@@ -131,3 +131,100 @@ No delivery endpoint is included in this slice. Payment verification and deliver
 - Every protected request rechecks the active user and current database permissions.
 - Customer and order endpoints return business records only to authenticated users with the required permission.
 - Do not store provider passwords, OTPs, recovery codes, or shared account credentials in this system.
+
+## Payment proof workflow
+
+### Private storage prerequisites
+
+Proof files are stored in a private S3-compatible object store. The API stores only file metadata and a private object key in PostgreSQL; it never returns a public file URL.
+
+Configure these API environment variables in Render before uploading real proofs:
+
+- `STORAGE_ENDPOINT`
+- `STORAGE_BUCKET`
+- `STORAGE_REGION` (default `auto`)
+- `STORAGE_FORCE_PATH_STYLE` (`false` for most providers)
+- `STORAGE_ACCESS_KEY`
+- `STORAGE_SECRET_KEY`
+
+Accepted files are JPG, PNG, WEBP, and PDF up to 10 MB. The API records a SHA-256 checksum, MIME type, byte size, original filename, uploader, and timestamp.
+
+### Upload payment proof
+
+`POST /api/v1/payment-proofs`
+
+Requires `payments.read` and must be sent as `multipart/form-data` with:
+
+| Field | Required | Description |
+|---|---:|---|
+| `order_id` | Yes | Existing order UUID |
+| `payment_method_code` | Yes | `KBZPAY`, `WAVEPAY`, or `AYAPAY` |
+| `claimed_amount` | Yes | Must match the order total in this MVP |
+| `transaction_reference` | Yes | Bank/wallet transaction reference |
+| `transaction_at` | No | ISO-8601 timestamp |
+| `file` | Yes | JPG, PNG, WEBP, or PDF proof |
+
+After upload:
+
+```text
+payment_proof.status = PROOF_RECEIVED
+order.status         = PAYMENT_PROOF_RECEIVED
+order.payment_status = PROOF_RECEIVED
+order.delivery_status = PENDING
+```
+
+### Owner review queue
+
+`GET /api/v1/payment-proofs?status=PROOF_RECEIVED&limit=50`
+
+Requires `payments.read`. The response includes customer/order context and file metadata, but not the private storage key.
+
+### Owner verify
+
+`POST /api/v1/payment-proofs/:id/verify`
+
+Requires `payments.verify`.
+
+```json
+{
+  "review_note": "Amount and transaction reference checked"
+}
+```
+
+The transaction atomically:
+
+1. Marks the proof `VERIFIED`.
+2. Creates or updates the order payment record as `VERIFIED`.
+3. Changes the order to `DELIVERY_PENDING`.
+4. Changes the order payment status to `VERIFIED`.
+5. Creates a `PENDING` manual digital-delivery queue record.
+6. Writes an audit-log entry.
+
+### Owner reject
+
+`POST /api/v1/payment-proofs/:id/reject`
+
+Requires `payments.verify`.
+
+```json
+{
+  "rejection_reason": "Transaction reference does not match the submitted proof",
+  "review_note": "Ask customer to resend a clear screenshot"
+}
+```
+
+The transaction marks the proof and payment record `REJECTED`, returns the order to `PAYMENT_PENDING`, keeps delivery blocked, and writes an audit-log entry. A proof cannot be reviewed twice after it reaches `VERIFIED` or `REJECTED`.
+
+## CS frontend workspace
+
+The authenticated dashboard now includes a **Customers & Order Creation** workspace:
+
+- Search customers by name, phone, email, or public code.
+- Open customer detail with phone, email, language, customer type, and order count.
+- Create a new Personal, Business, or Reseller customer.
+- Select an active product/access variation and quantity.
+- Select KBZPay, WavePay, or AYA Pay.
+- Create a `PAYMENT_PENDING` order.
+- View that customer's recent purchase history.
+
+The UI does not expose payment verification to CS. Every new order visibly states that delivery remains blocked until Owner verifies the payment proof.
