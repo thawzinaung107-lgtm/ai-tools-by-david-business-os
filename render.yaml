@@ -13,7 +13,7 @@ services:
       - key: NODE_ENV
         value: production
       - key: CORS_ORIGIN
-        sync: false
+        value: https://atd-web.onrender.com
       - key: DATABASE_URL
         fromDatabase:
           name: atd-postgres
@@ -69,9 +69,12 @@ services:
         - apps/web/**
         - package.json
         - pnpm-workspace.yaml
+        - pnpm-lock.yaml
     envVars:
+      - key: SKIP_INSTALL_DEPS
+        value: "true"
       - key: VITE_API_BASE_URL
-        sync: false
+        value: https://atd-api-aw7o.onrender.com
 
 databases:
   - name: atd-postgres
