@@ -38,23 +38,49 @@ app.get('/api/v1/meta', async () => ({
   },
 }));
 
-app.get('/api/v1/products', async () => {
+app.get('/api/v1/dashboard/summary', async () => {
   const result = await pool.query(`
-    select p.id, p.master_sku, p.name, p.status,
-           coalesce(json_agg(json_build_object(
-             'id', v.id,
-             'sku', v.sku,
-             'name', v.name,
-             'retail_price', v.retail_price,
-             'currency_code', v.currency_code,
-             'status', v.status
-           ) order by v.name) filter (where v.id is not null), '[]') as variations
-    from products p
-    left join product_variations v on v.product_id = p.id and v.deleted_at is null
-    where p.deleted_at is null
-    group by p.id
-    order by p.name
+    select
+      (select count(*)::int from leads where deleted_at is null and stage = 'NEW_INQUIRY') as new_inquiries,
+      (select count(*)::int from payment_proofs where status in ('PROOF_RECEIVED', 'NEED_MORE_INFORMATION')) as payment_proofs_waiting,
+      (select count(*)::int from orders where deleted_at is null and payment_status = 'VERIFIED' and delivery_status in ('PENDING', 'PROCESSING')) as delivery_pending,
+      (select count(*)::int from warranty_tickets where status in ('OPEN', 'IN_PROGRESS')) as open_warranty_cases,
+      (select count(*)::int from orders where deleted_at is null and created_at >= current_date) as orders_today,
+      (select coalesce(sum(total_amount), 0)::numeric from orders where deleted_at is null and payment_status = 'VERIFIED' and created_at >= current_date) as verified_revenue_today
   `);
+
+  return { data: result.rows[0] };
+});
+
+app.get('/api/v1/products', async (request) => {
+  const query = request.query as { status?: string };
+  const values: string[] = [];
+  const statusFilter = query.status ? `and p.status = $1` : '';
+  if (query.status) values.push(query.status);
+
+  const result = await pool.query(
+    `
+      select p.id, p.master_sku, p.name, p.short_description, p.status,
+             p.access_model, p.delivery_method, p.warranty_summary,
+             coalesce(json_agg(json_build_object(
+               'id', v.id,
+               'sku', v.sku,
+               'name', v.name,
+               'access_period_months', v.access_period_months,
+               'retail_price', v.retail_price,
+               'reseller_price', v.reseller_price,
+               'currency_code', v.currency_code,
+               'warranty_days', v.warranty_days,
+               'status', v.status
+             ) order by v.name) filter (where v.id is not null), '[]') as variations
+      from products p
+      left join product_variations v on v.product_id = p.id and v.deleted_at is null
+      where p.deleted_at is null ${statusFilter}
+      group by p.id
+      order by p.name
+    `,
+    values,
+  );
   return { data: result.rows };
 });
 
