@@ -3,7 +3,8 @@ services:
     name: atd-api
     runtime: node
     rootDir: .
-    buildCommand: corepack enable && pnpm install --frozen-lockfile=false && pnpm --filter @atd/api build && pnpm --filter @atd/api db:migrate
+    buildCommand: corepack enable && pnpm install --frozen-lockfile=false && pnpm --filter @atd/api build
+    preDeployCommand: pnpm --filter @atd/api db:migrate
     startCommand: pnpm --filter @atd/api start
     healthCheckPath: /ready
     plan: starter
