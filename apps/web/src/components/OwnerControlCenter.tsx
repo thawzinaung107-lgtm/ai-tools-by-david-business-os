@@ -90,7 +90,7 @@ export function OwnerControlCenter({ canVerify, canReport }: { canVerify: boolea
   const runStorageTest = async () => {
     setBusy(true); setError(''); setStorageStatus('Running private storage put/delete test…');
     try {
-      const payload = await apiRequest('/api/v1/storage/smoke-test', { method: 'POST' });
+      const payload = await apiRequest('/api/v1/storage/smoke-test', { method: 'POST', body: '{}' });
       setStorageStatus(`Storage PASS · ${payload.data.byteSize} bytes written and cleaned up`);
     } catch (requestError) {
       setStorageStatus('');
