@@ -36,6 +36,11 @@ const bootstrapSchema = loginSchema.extend({
   bootstrap_secret: z.string().min(1).max(200),
 });
 
+const staffSchema = loginSchema.extend({
+  display_name: z.string().trim().min(2).max(120),
+  role_code: z.enum(['OPERATIONS_MANAGER', 'CS_AGENT', 'FULFILMENT_AGENT']),
+});
+
 const customerSchema = z.object({
   display_name: z.string().trim().min(2).max(160),
   customer_type: z.enum(['PERSONAL', 'BUSINESS', 'RESELLER']).default('PERSONAL'),
@@ -175,6 +180,50 @@ app.post('/api/v1/auth/login', async (request, reply) => {
 });
 
 app.get('/api/v1/auth/me', { preHandler: authenticateRequest }, async (request) => ({ user: publicUser(request.auth!) }));
+
+app.get('/api/v1/users', { preHandler: requirePermission('users.manage') }, async () => {
+  const result = await pool.query(`
+    select u.id, u.email::text, u.display_name, u.status, u.last_login_at, u.created_at,
+           coalesce(array_agg(distinct r.code) filter (where r.code is not null), '{}') as roles
+    from users u
+    left join user_roles ur on ur.user_id = u.id
+    left join roles r on r.id = ur.role_id
+    where u.deleted_at is null
+    group by u.id
+    order by u.created_at desc
+  `);
+  return { data: result.rows };
+});
+
+app.post('/api/v1/users', { preHandler: requirePermission('users.manage') }, async (request, reply) => {
+  const parsed = staffSchema.safeParse(request.body);
+  if (!parsed.success) return sendValidationError(reply, parsed);
+  const passwordHash = await hashPassword(parsed.data.password);
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    const user = await client.query(`
+      insert into users (email, display_name, password_hash, status)
+      values ($1, $2, $3, 'ACTIVE')
+      returning id, email::text, display_name, status, created_at
+    `, [parsed.data.email.toLowerCase(), parsed.data.display_name, passwordHash]);
+    const role = await client.query('select id, code from roles where code = $1', [parsed.data.role_code]);
+    if (!role.rows[0]) {
+      await client.query('rollback');
+      return reply.code(400).send({ error: 'Requested role does not exist' });
+    }
+    await client.query('insert into user_roles (user_id, role_id, assigned_by) values ($1, $2, $3)', [user.rows[0].id, role.rows[0].id, request.auth!.userId]);
+    await client.query('insert into audit_logs (actor_user_id, action, entity_type, entity_id, after_json) values ($1, $2, $3, $4, $5)', [request.auth!.userId, 'CREATE_STAFF_USER', 'USER', user.rows[0].id, JSON.stringify({ email: user.rows[0].email, role: role.rows[0].code })]);
+    await client.query('commit');
+    return reply.code(201).send({ data: { ...user.rows[0], role: role.rows[0].code } });
+  } catch (error) {
+    await client.query('rollback');
+    if ((error as { code?: string }).code === '23505') return reply.code(409).send({ error: 'Email is already registered' });
+    throw error;
+  } finally {
+    client.release();
+  }
+});
 
 app.get('/api/v1/dashboard/summary', { preHandler: requirePermission('dashboard.read') }, async () => {
   const result = await pool.query(`
