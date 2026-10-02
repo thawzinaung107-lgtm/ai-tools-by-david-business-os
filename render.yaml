@@ -14,6 +14,10 @@ services:
         value: production
       - key: CORS_ORIGIN
         value: https://atd-web.onrender.com
+      - key: AUTH_SECRET
+        sync: false
+      - key: BOOTSTRAP_SECRET
+        sync: false
       - key: DATABASE_URL
         fromDatabase:
           name: atd-postgres
