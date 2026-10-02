@@ -10,10 +10,16 @@ function storageConfig() {
   const bucket = process.env.STORAGE_BUCKET;
   const accessKeyId = process.env.STORAGE_ACCESS_KEY;
   const secretAccessKey = process.env.STORAGE_SECRET_KEY;
-  if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) {
-    throw new Error('Private object storage is not configured');
+  const missing = [
+    ['STORAGE_ENDPOINT', endpoint],
+    ['STORAGE_BUCKET', bucket],
+    ['STORAGE_ACCESS_KEY', accessKeyId],
+    ['STORAGE_SECRET_KEY', secretAccessKey],
+  ].filter(([, value]) => !value).map(([name]) => name);
+  if (missing.length > 0) {
+    throw new Error(`Private object storage is not configured: ${missing.join(', ')}`);
   }
-  return { endpoint, bucket, accessKeyId, secretAccessKey };
+  return { endpoint: endpoint!, bucket: bucket!, accessKeyId: accessKeyId!, secretAccessKey: secretAccessKey! };
 }
 
 function storageClient(config: ReturnType<typeof storageConfig>) {
