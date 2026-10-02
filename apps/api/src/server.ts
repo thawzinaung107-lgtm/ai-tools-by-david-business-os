@@ -385,7 +385,14 @@ app.post('/api/v1/storage/smoke-test', { preHandler: requirePermission('payments
     return { data: await runStorageSmokeTest() };
   } catch (error) {
     if ((error as Error).message === 'Private object storage is not configured') return reply.code(503).send({ error: 'Private object storage is not configured yet' });
-    throw error;
+    const providerError = error as { name?: string; message?: string; $metadata?: { httpStatusCode?: number } };
+    app.log.error({ name: providerError.name, message: providerError.message, statusCode: providerError.$metadata?.httpStatusCode }, 'Storage smoke test failed');
+    return reply.code(502).send({
+      error: 'Storage provider rejected the smoke test',
+      provider: providerError.name ?? 'StorageError',
+      provider_status: providerError.$metadata?.httpStatusCode ?? null,
+      detail: (providerError.message ?? 'Unknown provider error').slice(0, 240),
+    });
   }
 });
 
