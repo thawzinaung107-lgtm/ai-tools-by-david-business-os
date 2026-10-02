@@ -1,0 +1,15 @@
+{
+  "name": "ai-tools-by-david-business-os",
+  "private": true,
+  "version": "0.1.0",
+  "description": "AI Tools By David Digital Store own CRM + POS platform",
+  "packageManager": "pnpm@10.6.2",
+  "scripts": {
+    "dev": "pnpm --parallel --filter @atd/api --filter @atd/web --filter @atd/worker dev",
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "db:migrate": "pnpm --filter @atd/api db:migrate",
+    "db:seed": "pnpm --filter @atd/api db:seed",
+    "lint": "pnpm -r lint"
+  }
+}

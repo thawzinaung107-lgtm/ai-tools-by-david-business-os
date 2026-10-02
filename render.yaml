@@ -1,0 +1,77 @@
+services:
+  - type: web
+    name: atd-api
+    runtime: node
+    rootDir: .
+    buildCommand: corepack enable && pnpm install --frozen-lockfile=false && pnpm --filter @atd/api build && pnpm --filter @atd/api db:migrate
+    startCommand: pnpm --filter @atd/api start
+    healthCheckPath: /ready
+    plan: starter
+    region: singapore
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: CORS_ORIGIN
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: atd-postgres
+          property: connectionString
+      - key: META_VERIFY_TOKEN
+        sync: false
+      - key: META_APP_SECRET
+        sync: false
+      - key: META_PAGE_ACCESS_TOKEN
+        sync: false
+
+  - type: worker
+    name: atd-worker
+    runtime: node
+    rootDir: .
+    buildCommand: corepack enable && pnpm install --frozen-lockfile=false && pnpm --filter @atd/worker build
+    startCommand: pnpm --filter @atd/worker start
+    plan: starter
+    region: singapore
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: atd-postgres
+          property: connectionString
+
+  - type: cron
+    name: atd-cron
+    runtime: node
+    rootDir: .
+    schedule: "*/15 * * * *"
+    buildCommand: corepack enable && pnpm install --frozen-lockfile=false && pnpm --filter @atd/worker build
+    startCommand: pnpm --filter @atd/worker cron
+    plan: starter
+    region: singapore
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: atd-postgres
+          property: connectionString
+
+  - type: static_site
+    name: atd-web
+    rootDir: .
+    buildCommand: corepack enable && pnpm install --frozen-lockfile=false && pnpm --filter @atd/web build
+    staticPublishPath: apps/web/dist
+    buildFilter:
+      paths:
+        - apps/web/**
+        - package.json
+        - pnpm-workspace.yaml
+    envVars:
+      - key: VITE_API_BASE_URL
+        sync: false
+
+databases:
+  - name: atd-postgres
+    plan: basic-256mb
+    region: singapore

@@ -1,0 +1,43 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: atd_business_os
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - atd_pgdata:/var/lib/postgresql/data
+
+  api:
+    image: node:22-slim
+    working_dir: /workspace
+    command: sh -c "corepack enable && pnpm install --frozen-lockfile=false && pnpm --filter @atd/api db:migrate && pnpm --filter @atd/api db:seed && pnpm --filter @atd/api dev"
+    environment:
+      NODE_ENV: development
+      PORT: 10000
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/atd_business_os
+      CORS_ORIGIN: http://localhost:5173
+    volumes:
+      - .:/workspace
+    ports:
+      - "10000:10000"
+    depends_on:
+      - postgres
+
+  web:
+    image: node:22-slim
+    working_dir: /workspace
+    command: sh -c "corepack enable && pnpm install --frozen-lockfile=false && pnpm --filter @atd/web dev"
+    environment:
+      VITE_API_BASE_URL: http://localhost:10000
+    volumes:
+      - .:/workspace
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api
+
+volumes:
+  atd_pgdata:
