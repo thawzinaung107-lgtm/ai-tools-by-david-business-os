@@ -48,6 +48,7 @@ export function OwnerControlCenter({ canVerify, canReport }: { canVerify: boolea
   const [rejectReason, setRejectReason] = React.useState('');
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState('');
+  const [storageStatus, setStorageStatus] = React.useState('');
 
   const loadProofs = React.useCallback(async () => {
     try {
@@ -86,9 +87,20 @@ export function OwnerControlCenter({ canVerify, canReport }: { canVerify: boolea
     } catch (requestError) { setError(requestError instanceof Error ? requestError.message : 'Unable to open proof'); }
   };
 
+  const runStorageTest = async () => {
+    setBusy(true); setError(''); setStorageStatus('Running private storage put/delete test…');
+    try {
+      const payload = await apiRequest('/api/v1/storage/smoke-test', { method: 'POST' });
+      setStorageStatus(`Storage PASS · ${payload.data.byteSize} bytes written and cleaned up`);
+    } catch (requestError) {
+      setStorageStatus('');
+      setError(requestError instanceof Error ? requestError.message : 'Storage smoke test failed');
+    } finally { setBusy(false); }
+  };
+
   const maxRevenue = Math.max(...(analytics?.daily ?? []).map((day) => Number(day.verified_revenue)), 1);
   return <section className="owner-control-center" id="payments">
-    <div className="owner-section-heading"><div><p className="eyebrow cyan">OWNER CONTROL CENTER</p><h2>Payment Verification & Analytics</h2><span>Payment decisions, delivery release, and performance signals in one place.</span></div><div className="owner-refresh"><button className="ghost-button" onClick={() => void loadProofs()}>Refresh queue</button>{canReport && <select value={rangeDays} onChange={(event) => setRangeDays(Number(event.target.value))}><option value={7}>7 days</option><option value={30}>30 days</option><option value={90}>90 days</option></select>}</div></div>
+    <div className="owner-section-heading"><div><p className="eyebrow cyan">OWNER CONTROL CENTER</p><h2>Payment Verification & Analytics</h2><span>Payment decisions, delivery release, and performance signals in one place.</span>{storageStatus && <small className="storage-status">{storageStatus}</small>}</div><div className="owner-refresh"><button className="ghost-button" onClick={() => void loadProofs()}>Refresh queue</button><button className="ghost-button" disabled={busy} onClick={() => void runStorageTest()}>Test storage</button>{canReport && <select value={rangeDays} onChange={(event) => setRangeDays(Number(event.target.value))}><option value={7}>7 days</option><option value={30}>30 days</option><option value={90}>90 days</option></select>}</div></div>
     {error && <div className="error-banner" role="alert">{error}</div>}
     <div className="owner-grid">
       <div className="owner-panel proof-panel"><div className="panel-heading"><div><p className="eyebrow">PAYMENT QUEUE</p><h3>Proofs waiting for review</h3></div><span className="queue-count">{proofs.length}</span></div>{proofs.length === 0 ? <div className="owner-empty"><div className="empty-icon">✓</div><strong>Queue is clear</strong><span>No payment proof is waiting for Owner review.</span></div> : <div className="proof-table-wrap"><table className="proof-table"><thead><tr><th>Customer / Order</th><th>Amount</th><th>Transaction</th><th>Proof</th><th>Action</th></tr></thead><tbody>{proofs.map((proof) => <tr key={proof.id}><td><strong>{proof.customer_name}</strong><span>{proof.order_code} • {proof.payment_method_name}</span></td><td><strong>{money(proof.claimed_amount)} MMK</strong><span>{shortDate(proof.transaction_at || '')}</span></td><td><span>{proof.transaction_reference}</span></td><td><button className="link-button" onClick={() => void openProof(proof.id)}>{proof.original_filename || 'View file'}</button></td><td><button className="review-button" onClick={() => { setReviewId(proof.id); setReviewNote(''); setRejectReason(''); }}>Review</button></td></tr>)}</tbody></table></div>}

@@ -17,7 +17,7 @@ import {
   verifyBootstrapSecret,
   verifyPassword,
 } from './auth.js';
-import { createPaymentProofViewUrl, uploadPaymentProofFile } from './storage.js';
+import { createPaymentProofViewUrl, runStorageSmokeTest, uploadPaymentProofFile } from './storage.js';
 import { queueCustomerNotification } from './notification_outbox.js';
 
 const app = Fastify({ logger: true });
@@ -378,6 +378,15 @@ app.get('/api/v1/notifications/outbox', { preHandler: requirePermission('notific
     limit $${values.length}
   `, values);
   return { data: result.rows };
+});
+
+app.post('/api/v1/storage/smoke-test', { preHandler: requirePermission('payments.verify') }, async (_request, reply) => {
+  try {
+    return { data: await runStorageSmokeTest() };
+  } catch (error) {
+    if ((error as Error).message === 'Private object storage is not configured') return reply.code(503).send({ error: 'Private object storage is not configured yet' });
+    throw error;
+  }
 });
 
 app.get('/api/v1/products', { preHandler: requirePermission('products.read') }, async (request) => {

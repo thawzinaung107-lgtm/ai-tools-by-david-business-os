@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 const MAX_PROOF_BYTES = 10 * 1024 * 1024;
@@ -61,4 +61,21 @@ export async function createPaymentProofViewUrl(storageKey: string) {
   const config = storageConfig();
   const client = storageClient(config);
   return getSignedUrl(client, new GetObjectCommand({ Bucket: config.bucket, Key: storageKey }), { expiresIn: 300 });
+}
+
+export async function runStorageSmokeTest() {
+  const bytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
+  const uploaded = await uploadPaymentProofFile({
+    paymentProofId: 'storage-smoke-test',
+    filename: 'storage-smoke-test.png',
+    mimeType: 'image/png',
+    bytes,
+  });
+  const config = storageConfig();
+  try {
+    await storageClient(config).send(new DeleteObjectCommand({ Bucket: config.bucket, Key: uploaded.storageKey }));
+  } catch (error) {
+    throw new Error(`Storage upload succeeded but cleanup failed: ${(error as Error).message}`);
+  }
+  return { status: 'PASS' as const, byteSize: uploaded.byteSize, checksumSha256: uploaded.checksumSha256 };
 }
